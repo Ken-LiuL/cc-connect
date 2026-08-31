@@ -21,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
 
@@ -130,6 +131,10 @@ type Platform struct {
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
+	// acceptInteractiveSelfMention admits only group interactive messages that
+	// carry a structured mention for this bot. It is deliberately opt-in so a
+	// deployment cannot broaden card ingress by upgrading cc-connect alone.
+	acceptInteractiveSelfMention bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -310,6 +315,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	acceptInteractiveSelfMention, _ := opts["accept_interactive_self_mention"].(bool)
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -386,33 +392,34 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	base := &Platform{
-		platformName:               name,
-		domain:                     domain,
-		appID:                      appID,
-		appSecret:                  appSecret,
-		progressStyle:              progressStyle,
-		useInteractiveCard:         useInteractiveCard,
-		reactionEmoji:              reactionEmoji,
-		doneEmoji:                  doneEmoji,
-		allowFrom:                  allowFrom,
-		allowChat:                  allowChat,
-		groupOnly:                  groupOnly,
-		groupReplyAll:              groupReplyAll,
-		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
-		shareSessionInChannel:      shareSessionInChannel,
-		threadIsolation:            threadIsolation,
-		resolveMentions:            resolveMentionsOpt,
-		noReplyToTrigger:           noReplyToTrigger,
-		client:                     lark.NewClient(appID, appSecret, clientOpts...),
-		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
-		dedup:                      &core.MessageDedup{},
-		port:                       port,
-		callbackPath:               callbackPath,
-		encryptKey:                 encryptKey,
-		peerBots:                   peerBots,
-		mentionMap:                 mentionMap,
-		imageBatch:                 make(map[string]*imageBatchEntry),
-		imageBatchWindow:           imageBatchWindow,
+		platformName:                 name,
+		domain:                       domain,
+		appID:                        appID,
+		appSecret:                    appSecret,
+		progressStyle:                progressStyle,
+		useInteractiveCard:           useInteractiveCard,
+		reactionEmoji:                reactionEmoji,
+		doneEmoji:                    doneEmoji,
+		allowFrom:                    allowFrom,
+		allowChat:                    allowChat,
+		groupOnly:                    groupOnly,
+		groupReplyAll:                groupReplyAll,
+		respondToAtEveryoneAndHere:   respondToAtEveryoneAndHere,
+		shareSessionInChannel:        shareSessionInChannel,
+		threadIsolation:              threadIsolation,
+		acceptInteractiveSelfMention: acceptInteractiveSelfMention,
+		resolveMentions:              resolveMentionsOpt,
+		noReplyToTrigger:             noReplyToTrigger,
+		client:                       lark.NewClient(appID, appSecret, clientOpts...),
+		replayClient:                 newFeishuReplayClient(appID, appSecret, domain),
+		dedup:                        &core.MessageDedup{},
+		port:                         port,
+		callbackPath:                 callbackPath,
+		encryptKey:                   encryptKey,
+		peerBots:                     peerBots,
+		mentionMap:                   mentionMap,
+		imageBatch:                   make(map[string]*imageBatchEntry),
+		imageBatchWindow:             imageBatchWindow,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -1303,6 +1310,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		chatID = *msg.ChatId
 	}
 	userID := userIDFromEvent(sender.SenderId)
+	senderType := stringValue(sender.SenderType)
 	// userName and chatName are resolved in dispatchMessage to avoid blocking
 	// the SDK dispatcher goroutine with synchronous HTTP calls.
 
@@ -1353,6 +1361,16 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// Pre-compute sessionKey so the @bot filter below can consult the active
 	// thread set; sessionKey is also used downstream for dispatch.
 	sessionKey := p.makeSessionKey(msg, chatID, userID)
+
+	if msgType == "interactive" {
+		botOpenID := p.getBotOpenID()
+		if !p.acceptInteractiveSelfMention || chatType != "group" || senderType != "app" || botOpenID == "" ||
+			!isBotMentioned(msg.Mentions, botOpenID) {
+			slog.Debug(p.tag()+": ignoring interactive message without enabled structured self mention",
+				"chat_id", chatID, "message_id", messageID)
+			return nil
+		}
+	}
 
 	if chatType == "group" && !p.groupReplyAll && p.getBotOpenID() != "" {
 		if !isBotMentioned(msg.Mentions, p.getBotOpenID()) {
@@ -1576,6 +1594,27 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
 			ReplyCtx:          rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
+
+	case "interactive":
+		text, ok := extractInboundInteractiveCardText(content)
+		if !ok {
+			slog.Warn(p.tag()+": dropping invalid or oversized interactive message",
+				"message_id", messageID, "content_bytes", len(content))
+			return
+		}
+		text = stripMentions(text, mentions, p.getBotOpenID())
+		if text == "" && quoted.text == "" && len(quoted.images) == 0 {
+			slog.Debug(p.tag()+": dropping empty interactive message after mention stripping",
+				"message_id", messageID)
+			return
+		}
+		p.dispatchCoreMessage(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: text, ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
@@ -2299,6 +2338,26 @@ func extractInteractiveCardText(content string) string {
 		return "[interactive card]"
 	}
 	return strings.Join(parts, "\n")
+}
+
+const (
+	maxInboundInteractiveCardBytes = 256 << 10
+	maxInboundInteractiveTextBytes = 64 << 10
+)
+
+// extractInboundInteractiveCardText is the fail-closed message-ingress wrapper
+// around the more permissive quoted-card renderer above. Interactive ingress
+// must never turn malformed, empty, or unbounded card JSON into an agent task.
+func extractInboundInteractiveCardText(content string) (string, bool) {
+	if content == "" || len(content) > maxInboundInteractiveCardBytes {
+		return "", false
+	}
+	text := strings.TrimSpace(extractInteractiveCardText(content))
+	if text == "" || text == "[interactive card]" || len(text) > maxInboundInteractiveTextBytes ||
+		!utf8.ValidString(text) {
+		return "", false
+	}
+	return text, true
 }
 
 // extractCardElements recursively extracts text from schema 2.0 card elements.

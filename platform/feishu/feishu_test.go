@@ -397,6 +397,176 @@ func TestOnMessageRepliesToUnauthorizedMention(t *testing.T) {
 	}
 }
 
+func TestOnMessageInteractiveSelfMentionOptInDispatchesVisibleText(t *testing.T) {
+	const botOpenID = "ou_target_bot"
+	got := make(chan *core.Message, 1)
+	p := &Platform{
+		platformName:                 "feishu",
+		botOpenID:                    botOpenID,
+		acceptInteractiveSelfMention: true,
+		dedup:                        &core.MessageDedup{},
+		handler:                      func(_ core.Platform, msg *core.Message) { got <- msg },
+	}
+
+	content := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"@_user_1 这是完整考卷，请一次答完"}]}}`
+	if err := p.onMessage(context.Background(), interactiveMessageEvent(
+		"om_interactive_self", "group", content, botOpenID,
+	)); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-got:
+		if msg.MessageID != "om_interactive_self" {
+			t.Fatalf("MessageID = %q", msg.MessageID)
+		}
+		if msg.Content != "这是完整考卷，请一次答完" {
+			t.Fatalf("Content = %q", msg.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for interactive self-mention dispatch")
+	}
+}
+
+func TestNewInteractiveSelfMentionIngressIsOptIn(t *testing.T) {
+	baseOptions := map[string]any{
+		"app_id":             "cli_test",
+		"app_secret":         "secret",
+		"enable_feishu_card": false,
+	}
+	created, err := newPlatform("feishu", lark.FeishuBaseUrl, baseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.(*Platform).acceptInteractiveSelfMention {
+		t.Fatal("interactive ingress was enabled by default")
+	}
+
+	baseOptions["accept_interactive_self_mention"] = true
+	created, err = newPlatform("feishu", lark.FeishuBaseUrl, baseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.(*Platform).acceptInteractiveSelfMention {
+		t.Fatal("explicit interactive ingress opt-in was ignored")
+	}
+}
+
+func TestOnMessageInteractiveIngressFailsClosed(t *testing.T) {
+	const botOpenID = "ou_target_bot"
+	tests := []struct {
+		name       string
+		enabled    bool
+		chatType   string
+		senderType string
+		content    string
+		mention    string
+	}{
+		{
+			name: "feature disabled", enabled: false, chatType: "group",
+			content: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"question"}]}}`,
+			mention: botOpenID,
+		},
+		{
+			name: "not self mentioned", enabled: true, chatType: "group",
+			content: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"question"}]}}`,
+			mention: "ou_other_bot",
+		},
+		{
+			name: "private chat", enabled: true, chatType: "p2p",
+			content: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"question"}]}}`,
+			mention: botOpenID,
+		},
+		{
+			name: "human sender", enabled: true, chatType: "group", senderType: "user",
+			content: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"question"}]}}`,
+			mention: botOpenID,
+		},
+		{
+			name: "malformed card", enabled: true, chatType: "group",
+			content: `{not-json`, mention: botOpenID,
+		},
+		{
+			name: "empty card", enabled: true, chatType: "group",
+			content: `{"schema":"2.0","body":{"elements":[]}}`, mention: botOpenID,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan *core.Message, 1)
+			p := &Platform{
+				platformName:                 "feishu",
+				botOpenID:                    botOpenID,
+				acceptInteractiveSelfMention: tc.enabled,
+				dedup:                        &core.MessageDedup{},
+				handler:                      func(_ core.Platform, msg *core.Message) { got <- msg },
+			}
+			event := interactiveMessageEvent(
+				"om_"+strings.ReplaceAll(tc.name, " ", "_"), tc.chatType, tc.content, tc.mention,
+			)
+			if tc.senderType != "" {
+				event.Event.Sender.SenderType = strPtr(tc.senderType)
+			}
+			if err := p.onMessage(context.Background(), event); err != nil {
+				t.Fatalf("onMessage() error = %v", err)
+			}
+			select {
+			case msg := <-got:
+				t.Fatalf("unexpected interactive dispatch: %#v", msg)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestExtractInboundInteractiveCardTextRejectsOversizedPayloads(t *testing.T) {
+	if _, ok := extractInboundInteractiveCardText(strings.Repeat("x", maxInboundInteractiveCardBytes+1)); ok {
+		t.Fatal("oversized raw card was accepted")
+	}
+	content := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"` +
+		strings.Repeat("x", maxInboundInteractiveTextBytes+1) + `"}]}}`
+	if _, ok := extractInboundInteractiveCardText(content); ok {
+		t.Fatal("oversized extracted text was accepted")
+	}
+}
+
+func interactiveMessageEvent(
+	messageID string,
+	chatType string,
+	content string,
+	mentionedOpenID string,
+) *larkim.P2MessageReceiveV1 {
+	msgType := "interactive"
+	senderType := "app"
+	createTime := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	mentions := []*larkim.MentionEvent{}
+	if mentionedOpenID != "" {
+		mentions = append(mentions, &larkim.MentionEvent{
+			Key:  strPtr("@_user_1"),
+			Id:   &larkim.UserId{OpenId: strPtr(mentionedOpenID)},
+			Name: strPtr("TargetBot"),
+		})
+	}
+	return &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   strPtr(messageID),
+				ChatId:      strPtr(""),
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createTime,
+				Mentions:    mentions,
+			},
+		},
+	}
+}
+
 func TestIsMessageRecalledDetectsWithdrawnMessageFromGetAPI(t *testing.T) {
 	const appID = "cli_recall_probe"
 	const appSecret = "secret-recall-probe"

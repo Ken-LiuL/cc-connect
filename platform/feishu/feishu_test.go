@@ -428,6 +428,81 @@ func TestOnMessageInteractiveSelfMentionOptInDispatchesVisibleText(t *testing.T)
 	}
 }
 
+func TestOnMessageInteractiveSelfMentionFetchesRawCardForRenderedProjection(t *testing.T) {
+	const (
+		appID     = "cli_interactive_projection"
+		appSecret = "secret-interactive-projection"
+		botOpenID = "ou_target_bot"
+		messageID = "om_interactive_projection"
+		question  = "考卷（重发，18 题，一次答完）"
+		eventBody = `[[{"tag":"at","user_id":"ou_target_bot","user_name":"NewAPIBot"},{"tag":"text","text":""}]]`
+		cardBody  = `<at id=ou_target_bot mention_key=@_user_1></at> ` + question
+	)
+
+	rawCard := `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":` +
+		strconv.Quote(cardBody) + `}]}}`
+	rawCardWrapper, err := json.Marshal(map[string]any{"json_card": rawCard})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages/"+messageID:
+			if got := r.URL.Query().Get("card_msg_content_type"); got != "raw_card_content" {
+				t.Fatalf("card_msg_content_type = %q", got)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{"items": []map[string]any{{
+					"msg_type": "interactive",
+					"body":     map[string]any{"content": string(rawCardWrapper)},
+				}}},
+			})
+		default:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success", "data": map[string]any{}})
+		}
+	}))
+	defer srv.Close()
+
+	got := make(chan *core.Message, 1)
+	p := &Platform{
+		platformName:                 "feishu",
+		domain:                       srv.URL,
+		appID:                        appID,
+		appSecret:                    appSecret,
+		botOpenID:                    botOpenID,
+		acceptInteractiveSelfMention: true,
+		dedup:                        &core.MessageDedup{},
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		handler: func(_ core.Platform, msg *core.Message) { got <- msg },
+	}
+
+	event := interactiveMessageEvent(messageID, "group", eventBody, botOpenID)
+	event.Event.Sender.SenderType = strPtr("bot")
+	if err := p.onMessage(context.Background(), event); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-got:
+		if msg.Content != question {
+			t.Fatalf("Content = %q, want %q", msg.Content, question)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for raw-card fallback dispatch")
+	}
+}
+
 func TestNewInteractiveSelfMentionIngressIsOptIn(t *testing.T) {
 	baseOptions := map[string]any{
 		"app_id":             "cli_test",
@@ -479,6 +554,11 @@ func TestOnMessageInteractiveIngressFailsClosed(t *testing.T) {
 		},
 		{
 			name: "human sender", enabled: true, chatType: "group", senderType: "user",
+			content: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"question"}]}}`,
+			mention: botOpenID,
+		},
+		{
+			name: "unknown sender", enabled: true, chatType: "group", senderType: "service",
 			content: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"question"}]}}`,
 			mention: botOpenID,
 		},

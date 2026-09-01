@@ -1364,7 +1364,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 
 	if msgType == "interactive" {
 		botOpenID := p.getBotOpenID()
-		if !p.acceptInteractiveSelfMention || chatType != "group" || senderType != "app" || botOpenID == "" ||
+		if !p.acceptInteractiveSelfMention || chatType != "group" || !isInteractiveBotSender(senderType) || botOpenID == "" ||
 			!isBotMentioned(msg.Mentions, botOpenID) {
 			slog.Debug(p.tag()+": ignoring interactive message without enabled structured self mention",
 				"chat_id", chatID, "message_id", messageID)
@@ -1600,10 +1600,18 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	case "interactive":
 		text, ok := extractInboundInteractiveCardText(content)
 		if !ok {
+			// Bot-authored cards received over the event stream can contain only
+			// Feishu's rendered projection (for example an at-tag plus an empty
+			// text node). Fetch the immutable message body as raw_card_content so
+			// the visible card DSL is available to the same bounded parser.
+			text, ok = p.fetchInboundInteractiveCardText(ctx, messageID)
+		}
+		if !ok {
 			slog.Warn(p.tag()+": dropping invalid or oversized interactive message",
 				"message_id", messageID, "content_bytes", len(content))
 			return
 		}
+		text = replaceInteractiveMentionTags(text, mentions, p.getBotOpenID())
 		text = stripMentions(text, mentions, p.getBotOpenID())
 		if text == "" && quoted.text == "" && len(quoted.images) == 0 {
 			slog.Debug(p.tag()+": dropping empty interactive message after mention stripping",
@@ -2343,6 +2351,7 @@ func extractInteractiveCardText(content string) string {
 const (
 	maxInboundInteractiveCardBytes = 256 << 10
 	maxInboundInteractiveTextBytes = 64 << 10
+	maxInboundInteractiveAPIBytes  = 768 << 10
 )
 
 // extractInboundInteractiveCardText is the fail-closed message-ingress wrapper
@@ -2358,6 +2367,81 @@ func extractInboundInteractiveCardText(content string) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func isInteractiveBotSender(senderType string) bool {
+	switch strings.ToLower(strings.TrimSpace(senderType)) {
+	case "app", "bot":
+		return true
+	default:
+		return false
+	}
+}
+
+// fetchInboundInteractiveCardText retrieves the vendor-authoritative raw card
+// body for event payloads that contain only a rendered card projection. This
+// path is called only after onMessage has verified a group bot/app sender and
+// a structured self mention. The response and extracted text remain bounded.
+func (p *Platform) fetchInboundInteractiveCardText(ctx context.Context, messageID string) (string, bool) {
+	if p.client == nil || strings.TrimSpace(messageID) == "" {
+		return "", false
+	}
+	apiPath := fmt.Sprintf("/open-apis/im/v1/messages/%s?card_msg_content_type=raw_card_content", messageID)
+	apiResp, err := p.client.Get(ctx, apiPath, nil, larkcore.AccessTokenTypeTenant)
+	if err != nil || apiResp == nil {
+		slog.Warn(p.tag()+": fetch raw interactive message failed", "message_id", messageID, "error", err)
+		return "", false
+	}
+	if len(apiResp.RawBody) == 0 || len(apiResp.RawBody) > maxInboundInteractiveAPIBytes {
+		slog.Warn(p.tag()+": raw interactive message response is empty or oversized",
+			"message_id", messageID, "response_bytes", len(apiResp.RawBody))
+		return "", false
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Items []struct {
+				MsgType string `json:"msg_type"`
+				Body    struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(apiResp.RawBody, &resp); err != nil || resp.Code != 0 || len(resp.Data.Items) != 1 {
+		slog.Warn(p.tag()+": raw interactive message response is invalid",
+			"message_id", messageID, "code", resp.Code, "item_count", len(resp.Data.Items))
+		return "", false
+	}
+	item := resp.Data.Items[0]
+	if item.MsgType != "interactive" {
+		slog.Warn(p.tag()+": raw interactive message type changed",
+			"message_id", messageID, "message_type", item.MsgType)
+		return "", false
+	}
+	return extractInboundInteractiveCardText(item.Body.Content)
+}
+
+// replaceInteractiveMentionTags converts CardKit markdown at-tags into the
+// same placeholder form handled by stripMentions. Feishu's raw card DSL uses
+// an empty <at ... mention_key=@_user_N></at> element rather than rendering the
+// placeholder in text.
+func replaceInteractiveMentionTags(text string, mentions []*larkim.MentionEvent, botOpenID string) string {
+	for _, mention := range mentions {
+		if mention == nil || mention.Key == nil || strings.TrimSpace(*mention.Key) == "" {
+			continue
+		}
+		replacement := ""
+		if mention.Id == nil || mention.Id.OpenId == nil || *mention.Id.OpenId != botOpenID {
+			if mention.Name != nil && strings.TrimSpace(*mention.Name) != "" {
+				replacement = "@" + strings.TrimSpace(*mention.Name)
+			}
+		}
+		pattern := regexp.MustCompile(`(?i)<at\b[^>]*\bmention_key\s*=\s*["']?` +
+			regexp.QuoteMeta(*mention.Key) + `["']?[^>]*>\s*</at>`)
+		text = pattern.ReplaceAllString(text, replacement)
+	}
+	return strings.TrimSpace(text)
 }
 
 // extractCardElements recursively extracts text from schema 2.0 card elements.

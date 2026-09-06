@@ -1498,7 +1498,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
+			Content: text, Mentions: coreMentions(mentions, p.getBotOpenID()),
+			ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
@@ -3494,6 +3495,29 @@ func (p *Platform) isActiveThreadSession(sessionKey string) bool {
 // stripMentions processes @mention placeholders (e.g. @_user_1) in text.
 // The bot's own mention is removed; other user mentions are replaced with
 // their display name so the agent can see who was referenced.
+func coreMentions(mentions []*larkim.MentionEvent, botOpenID string) []core.Mention {
+	if len(mentions) == 0 {
+		return nil
+	}
+	result := make([]core.Mention, 0, len(mentions))
+	for _, mention := range mentions {
+		if mention == nil || mention.Id == nil {
+			continue
+		}
+		value := strings.TrimSpace(stringValue(mention.Id.OpenId))
+		if value == "" {
+			continue
+		}
+		result = append(result, core.Mention{
+			IDType: "open_id",
+			Value:  value,
+			Name:   strings.TrimSpace(stringValue(mention.Name)),
+			IsSelf: value == botOpenID,
+		})
+	}
+	return result
+}
+
 func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID string) string {
 	if len(mentions) == 0 {
 		return text

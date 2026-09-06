@@ -336,6 +336,17 @@ type LocationAttachment struct {
 	ProximityAlertRadius int     // maximum distance for proximity alerts in meters (optional)
 }
 
+// Mention is a structured participant mention extracted from a platform event.
+// Keeping this at the core boundary prevents adapters from having to recover
+// mention identity through a secondary message-details API, which may omit the
+// mentions array for otherwise valid events.
+type Mention struct {
+	IDType string
+	Value  string
+	Name   string
+	IsSelf bool
+}
+
 // Message represents a unified incoming message from any platform.
 type Message struct {
 	SessionKey   string // unique key for user context, e.g. "feishu:{chatID}:{userID}"
@@ -347,6 +358,7 @@ type Message struct {
 	UserName     string
 	ChatName     string // human-readable chat/group name (optional)
 	Content      string
+	Mentions     []Mention           // structured participant mentions from the inbound event
 	Images       []ImageAttachment   // attached images (if any)
 	Files        []FileAttachment    // attached files (if any)
 	Audio        *AudioAttachment    // voice message (if any)

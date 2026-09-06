@@ -110,6 +110,7 @@ type replyContext struct {
 	messageID       string
 	chatID          string
 	sessionKey      string
+	chatType        string
 	bootstrapThread bool
 }
 
@@ -1555,6 +1556,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// blocked by IO-heavy operations (image/audio download, handler HTTP calls).
 	// The dedup and old-message checks above remain synchronous to guarantee
 	// correctness before spawning the goroutine.
+	rctx.chatType = chatType
 	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, createTimeMs)
 
 	return nil
@@ -1631,6 +1633,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: quoted.images, Files: quotedFiles, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
@@ -1676,6 +1679,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content:           "",
 			ExtraContent:      quoted.text,
@@ -1709,6 +1713,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Audio: &core.AudioAttachment{
 				MimeType: "audio/opus",
@@ -1731,6 +1736,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
 			ReplyCtx:          rctx,
@@ -1762,6 +1768,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Files: []core.FileAttachment{{
 				MimeType: mimeType,
@@ -1783,6 +1790,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		coreMsg := &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content:           text,
 			Images:            images,
@@ -1809,6 +1817,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			p.dispatchCoreMessage(&core.Message{
 				SessionKey: sessionKey, Platform: p.platformName,
 				MessageID: messageID,
+				ChannelType: rctx.chatType,
 				UserID:    userID, UserName: userName, ChatName: chatName,
 				Content: "[sticker]", ExtraContent: quoted.text, ReplyCtx: rctx,
 				UserMessageTimeMs: createTimeMs,
@@ -1820,6 +1829,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Images:            []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
 			ReplyCtx:          rctx,
@@ -1859,6 +1869,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,

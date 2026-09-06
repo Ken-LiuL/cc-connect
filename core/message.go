@@ -354,6 +354,9 @@ type Message struct {
 	MessageID    string // platform message ID for tracing
 	Recalled     bool   // true for platform message recall/delete events targeting MessageID
 	ChannelID    string
+	// ChannelType is the vendor-reported conversation type (for example
+	// "p2p" or "group").
+	ChannelType  string
 	UserID       string
 	UserName     string
 	ChatName     string // human-readable chat/group name (optional)

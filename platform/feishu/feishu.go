@@ -111,6 +111,7 @@ type replyContext struct {
 	messageID  string
 	chatID     string
 	sessionKey string
+	chatType   string
 }
 
 type Platform struct {
@@ -1436,6 +1437,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// blocked by IO-heavy operations (image/audio download, handler HTTP calls).
 	// The dedup and old-message checks above remain synchronous to guarantee
 	// correctness before spawning the goroutine.
+	rctx.chatType = chatType
 	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, createTimeMs)
 
 	return nil
@@ -1497,6 +1499,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
+			ChannelType: rctx.chatType,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, Mentions: coreMentions(mentions, p.getBotOpenID()),
 			ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
